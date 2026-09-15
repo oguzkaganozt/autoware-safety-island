@@ -34,12 +34,14 @@ inline const char * guard_state_name(const GuardState s)
 }
 
 inline constexpr double kFollowerTimeoutMs = 500.0;
-inline constexpr double kTrajTimeoutMs = 1000.0;
+inline constexpr double kTrajTimeoutMs = 3000.0;
 inline constexpr double kOdomTimeoutMs = 500.0;
 inline constexpr double kBabbleRateHz = 40.0;
 inline constexpr double kBabbleDvMps = 8.0;
 inline constexpr double kBabbleDsteerRad = 0.4;
+inline constexpr double kBabbleSteerVRefMps = 5.0;
 inline constexpr double kBabbleDaMps2 = 6.0;
+inline constexpr double kBabbleSteerGateMps = 0.5;
 inline constexpr double kALonPosMax = 4.0;
 inline constexpr double kALonNegMax = 6.0;
 inline constexpr double kALatMax = 3.0;
@@ -47,6 +49,7 @@ inline constexpr double kEnvelopeMargin = 1.2;
 inline constexpr double kVMaxMps = 40.0;
 inline constexpr double kSteerMaxRad = 0.65;
 inline constexpr int kClearFrames = 10;
+inline constexpr double kComfortableDecel = -0.8;
 inline constexpr double kEmergencyDecel = -3.0;
 inline constexpr int kMaxSpeeds = 16;
 inline constexpr int kArrivalCap = 8;
@@ -170,10 +173,7 @@ public:
       } else {
         clear_count_ = 0;
       }
-      if (ego_stopped) {
-        return enter(GuardState::HOLD, "comfortable-stop", now_ms);
-      }
-      return make_out(GuardState::COMFORTABLE, reason, true, brake_cmd(now_ms));
+      return make_out(GuardState::COMFORTABLE, reason, true, comfortable_cmd(now_ms));
     }
 
     if (state == GuardState::EMERGENCY) {
@@ -233,13 +233,28 @@ private:
       skip_jump_once_ = true;
       arrival_n_ = 0;
     }
-    if (s == GuardState::COMFORTABLE || s == GuardState::EMERGENCY) {
+    if (s == GuardState::EMERGENCY) {
       false_stop_entries += 1;
     }
     if (s == GuardState::FRESH) {
       return make_out(s, r, false, FollowerCmd{});
     }
+    if (s == GuardState::COMFORTABLE) {
+      return make_out(s, r, true, comfortable_cmd(now_ms));
+    }
     return make_out(s, r, true, brake_cmd(now_ms));
+  }
+
+  FollowerCmd comfortable_cmd(const double now_ms) const
+  {
+    FollowerCmd b;
+    b.stamp_ms = now_ms;
+    const double v =
+      (has_follower_ && guard_finite(last_follower_.velocity)) ? last_follower_.velocity : 0.0;
+    b.velocity = v > 0.0 ? v : 0.0;
+    b.accel = kComfortableDecel;
+    b.steer = (has_follower_ && guard_finite(last_follower_.steer)) ? last_follower_.steer : 0.0;
+    return b;
   }
 
   FollowerCmd brake_cmd(const double now_ms) const
@@ -272,10 +287,23 @@ private:
       }
     }
     if (has_prev_ && last_follower_.stamp_ms > prev_follower_.stamp_ms) {
-      if (std::fabs(cmd.velocity - prev_follower_.velocity) > kBabbleDvMps) {
+      if (cmd.velocity - prev_follower_.velocity > kBabbleDvMps &&
+          std::fabs(prev_follower_.velocity) >= kBabbleSteerGateMps) {
         return "babbling-jump-v";
       }
-      if (std::fabs(cmd.steer - prev_follower_.steer) > kBabbleDsteerRad) {
+      const double v_prev = guard_finite(prev_follower_.velocity) ? std::fabs(prev_follower_.velocity) : 0.0;
+      const double v_cmd = std::fabs(cmd.velocity);
+      const bool near_stop = v_prev < kBabbleSteerGateMps && v_cmd < kBabbleSteerGateMps;
+      const double v_scale = (v_prev > v_cmd ? v_prev : v_cmd);
+      const double v_ref = v_scale < kBabbleSteerGateMps ? kBabbleSteerGateMps : v_scale;
+      double scale = kBabbleSteerVRefMps / v_ref;
+      if (scale > 2.0) {
+        scale = 2.0;
+      } else if (scale < 0.5) {
+        scale = 0.5;
+      }
+      const double steer_lim = kBabbleDsteerRad * scale;
+      if (!near_stop && std::fabs(cmd.steer - prev_follower_.steer) > steer_lim) {
         return "babbling-jump-steer";
       }
       if (std::fabs(cmd.accel - prev_follower_.accel) > kBabbleDaMps2) {

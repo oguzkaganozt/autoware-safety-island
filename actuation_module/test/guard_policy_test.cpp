@@ -12,6 +12,7 @@ using autoware::motion::control::trajectory_follower_node::TrajSnapshot;
 using autoware::motion::control::trajectory_follower_node::EgoSnapshot;
 using autoware::motion::control::trajectory_follower_node::kClearFrames;
 using autoware::motion::control::trajectory_follower_node::kFollowerTimeoutMs;
+using autoware::motion::control::trajectory_follower_node::kComfortableDecel;
 using autoware::motion::control::trajectory_follower_node::kTrajTimeoutMs;
 using autoware::motion::control::trajectory_follower_node::guard_state_name;
 
@@ -101,8 +102,23 @@ int main()
   }
   {
     GuardPolicy g;
-    drive_comfortable(g);
+    live(g, 1000.0);
+    g.step(1010.0);
+    const double t = 1000.0 + 1500.0;
+    g.on_follower(cmd(t));
+    g.on_odom(ego(t));
+    auto out = g.step(t);
+    expect(out.state == GuardState::FRESH, "short traj gap stays fresh");
+    expect(!out.has_override, "short traj gap passthrough");
+  }
+  {
+    GuardPolicy g;
+    const double t = drive_comfortable(g);
     expect(g.state == GuardState::COMFORTABLE, "stale traj comfortable");
+    auto out = g.step(t);
+    expect(out.has_override, "comfortable overrides");
+    expect(out.override_cmd.velocity > 0.1, "comfortable keeps speed");
+    expect(std::fabs(out.override_cmd.accel - kComfortableDecel) < 1e-9, "comfortable decel");
   }
   {
     GuardPolicy g;
@@ -162,6 +178,31 @@ int main()
     GuardPolicy g;
     live(g, 1000.0, 0.0);
     g.step(1010.0);
+    const double t = 1000.0 + kTrajTimeoutMs + 10.0;
+    g.on_follower(cmd(t, 0.0));
+    g.on_odom(ego(t, 0.0));
+    auto out = g.step(t);
+    expect(out.state == GuardState::COMFORTABLE, "stale traj at rest comfortable");
+    expect(out.has_override, "comfortable overrides");
+    g.on_follower(cmd(t + 50.0, 0.0));
+    g.on_odom(ego(t + 50.0, 0.0));
+    out = g.step(t + 50.0);
+    expect(out.state == GuardState::COMFORTABLE, "at rest does not hold");
+    autoware::motion::control::trajectory_follower_node::GuardOutput recovered{};
+    for (int i = 1; i <= kClearFrames; ++i) {
+      const double ti = t + 100.0 * i;
+      g.on_follower(cmd(ti, 0.0));
+      g.on_traj(traj(ti, 0.0), ti);
+      g.on_odom(ego(ti, 0.0));
+      recovered = g.step(ti);
+    }
+    expect(recovered.state == GuardState::FRESH, "at rest traj recovered");
+    expect(!recovered.has_override, "at rest recovered passthrough");
+  }
+  {
+    GuardPolicy g;
+    live(g, 1000.0, 0.0);
+    g.step(1010.0);
     g.on_follower(cmd(1020.0, NAN));
     g.on_odom(ego(1020.0, 0.0));
     g.on_traj(traj(1020.0, 0.0), 1020.0);
@@ -205,6 +246,73 @@ int main()
     g.on_odom(ego(1020.0, 16.0));
     auto out = g.step(1020.0);
     expect(out.state == GuardState::FRESH, "hard stop not a fault");
+  }
+  {
+    GuardPolicy g;
+    live(g, 1000.0, 9.4);
+    g.step(1010.0);
+    g.on_follower(cmd(1020.0, 0.0, -0.8));
+    g.on_traj(traj(1020.0, 0.0), 1020.0);
+    g.on_odom(ego(1020.0, 9.4));
+    auto out = g.step(1020.0);
+    expect(out.state == GuardState::FRESH, "smooth stop drop is not babble");
+  }
+  {
+    GuardPolicy g;
+    live(g, 1000.0, 0.0);
+    g.step(1010.0);
+    g.on_follower(cmd(1015.0, 0.0));
+    g.on_traj(traj(1015.0, 0.0), 1015.0);
+    g.on_odom(ego(1015.0, 0.0));
+    g.step(1015.0);
+    g.on_follower(cmd(1020.0, 9.4));
+    g.on_traj(traj(1020.0, 9.4), 1020.0);
+    g.on_odom(ego(1020.0, 0.0));
+    auto out = g.step(1020.0);
+    expect(out.state == GuardState::FRESH, "pull away from stop is not babble");
+  }
+  {
+    GuardPolicy g;
+    live(g, 1000.0, 0.0);
+    g.step(1010.0);
+    g.on_follower(cmd(1015.0, 0.0));
+    g.on_traj(traj(1015.0, 0.0), 1015.0);
+    g.on_odom(ego(1015.0, 0.0));
+    g.step(1015.0);
+    g.on_follower(cmd(1020.0, 0.0, 0.0, 0.5));
+    g.on_traj(traj(1020.0, 0.0), 1020.0);
+    g.on_odom(ego(1020.0, 0.0));
+    auto out = g.step(1020.0);
+    expect(out.state == GuardState::FRESH, "dry steer at standstill is not babble");
+  }
+  {
+    GuardPolicy g;
+    live(g, 1000.0, 5.0);
+    g.step(1010.0);
+    g.on_follower(cmd(1015.0, 5.0));
+    g.on_traj(traj(1015.0, 5.0), 1015.0);
+    g.on_odom(ego(1015.0, 5.0));
+    g.step(1015.0);
+    g.on_follower(cmd(1020.0, 5.0, 0.0, 0.5));
+    g.on_traj(traj(1020.0, 5.0), 1020.0);
+    g.on_odom(ego(1020.0, 5.0));
+    auto out = g.step(1020.0);
+    expect(out.state == GuardState::EMERGENCY, "steer jump at speed is babble");
+    expect(std::strcmp(out.reason, "babbling-jump-steer") == 0, "steer jump reason");
+  }
+  {
+    GuardPolicy g;
+    live(g, 1000.0, 1.6);
+    g.step(1010.0);
+    g.on_follower(cmd(1015.0, 1.6));
+    g.on_traj(traj(1015.0, 1.6), 1015.0);
+    g.on_odom(ego(1015.0, 1.6));
+    g.step(1015.0);
+    g.on_follower(cmd(1020.0, 1.6, 0.0, 0.5));
+    g.on_traj(traj(1020.0, 1.6), 1020.0);
+    g.on_odom(ego(1020.0, 1.6));
+    auto out = g.step(1020.0);
+    expect(out.state == GuardState::FRESH, "steer jump at crawl is scaled");
   }
   {
     GuardPolicy g;
