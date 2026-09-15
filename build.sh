@@ -33,6 +33,7 @@ BUILD_PLATFORM_SET=0
 NETWORK_PROFILE="default"
 DDS_NETWORK_INTERFACE=""
 CONTROL_CMD_OUTPUT_MODE=""
+GUARD_ENABLE=""
 RUNTIME_TARGET_LIST=("zephyr-fvp" "zephyr-s32z" "freertos-posix" "freertos-s32z2" "freertos-x5h")
 ZEPHYR_TARGET_LIST=("fvp_baser_aemv8r_smp" "s32z270dc2_rtu0_r52@D")
 ZEPHYR_TARGET=${ZEPHYR_TARGET_LIST[0]} # Default target is fvp_baser_aemv8r_smp
@@ -46,6 +47,7 @@ function usage() {
   echo -e "${GREEN}    --network          ${NC}Network profile: default, tap. tap is valid for zephyr-fvp."
   echo -e "${GREEN}    --dds-interface    ${NC}DDS interface/IP selector for FreeRTOS targets."
   echo -e "${GREEN}    --control-output   ${NC}FreeRTOS control output: DDS_ONLY, CAN_ONLY, DDS_AND_CAN."
+  echo -e "${GREEN}    --guard            ${NC}Compile-time SI output guard: on, off. default: on."
   echo -e "${GREEN}    -t                 ${NC}Zephyr target board: ${ZEPHYR_TARGET_LIST[*]}"
   echo -e "${GREEN}                         default: ${ZEPHYR_TARGET_LIST[0]}.${NC}"
   echo -e "${GREEN}    -d                 ${NC}Build directory. Default: ${BUILD_DIR}."
@@ -121,6 +123,18 @@ function parse_args() {
       --control-output)
         require_arg "$1" "${2:-}"
         CONTROL_CMD_OUTPUT_MODE="$2"
+        shift 2
+        ;;
+      --guard)
+        require_arg "$1" "${2:-}"
+        case "$2" in
+          on|ON|1|y|Y) GUARD_ENABLE="ON" ;;
+          off|OFF|0|n|N) GUARD_ENABLE="OFF" ;;
+          *)
+            echo -e "${RED}--guard must be on or off${NC}" 1>&2
+            exit 1
+            ;;
+        esac
         shift 2
         ;;
       --unit-test)
@@ -334,6 +348,10 @@ function build_zephyr_actuation_module() {
     extra_conf_files+=("${board_conf}")
   fi
 
+  if [ "${GUARD_ENABLE}" = "OFF" ]; then
+    extra_conf_files+=("${ROOT_DIR}/actuation_module/boards/guard_off.conf")
+  fi
+
   if [ "${NETWORK_PROFILE}" = "tap" ]; then
     extra_conf_files+=("${ROOT_DIR}/actuation_module/boards/fvp_baser_aemv8r_smp_tap_network.conf")
     local fvp_tap_interface="${FVP_TAP_INTERFACE:-tap0}"
@@ -394,6 +412,9 @@ function build_freertos_posix() {
   if [ -n "${CONTROL_CMD_OUTPUT_MODE}" ]; then
     freertos_args+=(-DCONFIG_CONTROL_CMD_OUTPUT_MODE="${CONTROL_CMD_OUTPUT_MODE}")
   fi
+  if [ -n "${GUARD_ENABLE}" ]; then
+    freertos_args+=(-DCONFIG_GUARD_ENABLE="${GUARD_ENABLE}")
+  fi
 
   cmake "${freertos_args[@]}"
   cmake --build "${app_build_dir}" -j"$(nproc)"
@@ -429,6 +450,9 @@ function build_freertos_s32z2() {
   fi
   if [ -n "${CONTROL_CMD_OUTPUT_MODE}" ]; then
     freertos_args+=(-DCONFIG_CONTROL_CMD_OUTPUT_MODE="${CONTROL_CMD_OUTPUT_MODE}")
+  fi
+  if [ -n "${GUARD_ENABLE}" ]; then
+    freertos_args+=(-DCONFIG_GUARD_ENABLE="${GUARD_ENABLE}")
   fi
 
   cmake "${freertos_args[@]}"
@@ -509,6 +533,9 @@ function build_freertos_x5h() {
   fi
   if [ -n "${CONTROL_CMD_OUTPUT_MODE}" ]; then
     x5h_args+=(-DCONFIG_CONTROL_CMD_OUTPUT_MODE="${CONTROL_CMD_OUTPUT_MODE}")
+  fi
+  if [ -n "${GUARD_ENABLE}" ]; then
+    x5h_args+=(-DCONFIG_GUARD_ENABLE="${GUARD_ENABLE}")
   fi
 
   cmake "${x5h_args[@]}"

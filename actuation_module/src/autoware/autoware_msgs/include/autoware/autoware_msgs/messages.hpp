@@ -13,6 +13,7 @@
 #include "Lateral.h"
 #include "PoseStamped.h"
 #include "Float64Stamped.h"
+#include "Float64.h"
 #include "TrajectoryPoint.h"
 #include "Point.h"
 #include "Pose.h"
@@ -41,6 +42,7 @@ using TrajectoryMsg_Raw = autoware_planning_msgs_msg_Trajectory;
 using AccelerationMsg = geometry_msgs_msg_AccelWithCovarianceStamped;
 using OperationModeStateMsg = autoware_adapi_v1_msgs_msg_OperationModeState;
 using Float64StampedMsg = tier4_debug_msgs_msg_Float64Stamped;
+using Float64Msg = std_msgs_msg_Float64;
 using ControlMsg = autoware_control_msgs_msg_Control;
 using OdometryMsg = nav_msgs_msg_Odometry;
 using SteeringReportMsg = autoware_vehicle_msgs_msg_SteeringReport;

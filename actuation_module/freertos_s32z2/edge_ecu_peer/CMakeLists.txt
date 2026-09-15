@@ -57,6 +57,10 @@ set(CONFIG_CONTROL_CMD_OUTPUT_CAN_ONLY 0)
 set(CONFIG_CONTROL_CMD_OUTPUT_DDS_AND_CAN 0)
 set(CONFIG_CONTROL_CMD_CAN_OUTPUT 0)
 set(CONFIG_CONTROL_CMD_DDS_OUTPUT 1)
+set(CONFIG_GUARD_ENABLE OFF)
+set(CONFIG_SI_MODE_RUN 1)
+set(CONFIG_SI_MODE_AUTOWARE 0)
+set(CONFIG_SI_MODE_STOP 0)
 
 # Generate the platform config header (same template the simulator uses).
 configure_file(

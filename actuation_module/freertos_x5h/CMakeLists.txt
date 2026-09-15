@@ -331,6 +331,20 @@ else()
     message(FATAL_ERROR "Unsupported CONFIG_CONTROL_CMD_OUTPUT_MODE=${CONFIG_CONTROL_CMD_OUTPUT_MODE}. Use DDS_ONLY, CAN_ONLY, or DDS_AND_CAN.")
 endif()
 
+set(CONFIG_GUARD_ENABLE ON CACHE BOOL "Enable SI output guard")
+set(CONFIG_SI_MODE "RUN" CACHE STRING "SI run mode: RUN, AUTOWARE, STOP")
+set_property(CACHE CONFIG_SI_MODE PROPERTY STRINGS "RUN" "AUTOWARE" "STOP")
+set(CONFIG_SI_MODE_RUN 0)
+set(CONFIG_SI_MODE_AUTOWARE 0)
+set(CONFIG_SI_MODE_STOP 0)
+if(CONFIG_SI_MODE STREQUAL "AUTOWARE")
+    set(CONFIG_SI_MODE_AUTOWARE 1)
+elseif(CONFIG_SI_MODE STREQUAL "STOP")
+    set(CONFIG_SI_MODE_STOP 1)
+else()
+    set(CONFIG_SI_MODE_RUN 1)
+endif()
+
 # ${X5H_ACTUATION_DIR}, not CMAKE_CURRENT_SOURCE_DIR: see the header comment
 # at the top of this file -- CMAKE_CURRENT_SOURCE_DIR is the vendor's own
 # directory under a plain include().

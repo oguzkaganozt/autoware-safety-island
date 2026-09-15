@@ -34,6 +34,7 @@
 
 #include "common/node/node.hpp"
 #include "autoware/autoware_msgs/messages.hpp"
+#include "autoware/trajectory_follower_node/guard_policy.hpp"
 
 namespace autoware::motion::control
 {
@@ -72,26 +73,19 @@ private:
 
   // Subscribers
   static void callbackSteeringStatus(const SteeringReportMsg* msg, void* arg);
-  static void callbackOperationModeState(const OperationModeStateMsg* msg, void* arg);
+
   static void callbackOdometry(const OdometryMsg* msg, void* arg);
   static void callbackAcceleration(const AccelWithCovarianceStampedMsg* msg, void* arg);
   static void callbackTrajectory(const TrajectoryMsg_Raw* msg, void* arg);
+  static void callbackReEnable(const Float64Msg* msg, void* arg);
+  static void callbackOperationModeState(const OperationModeStateMsg* msg, void* arg);
 
   // Current Data
   TrajectoryMsg current_trajectory_;
   OdometryMsg current_odometry_;
   SteeringReportMsg current_steering_;
   AccelWithCovarianceStampedMsg current_accel_;
-  /*
-    mode: 1,
-    is_autoware_control_enabled: true,
-    is_in_transition: false,
-    is_stop_mode_available: true,
-    is_autonomous_mode_available: true,
-    is_local_mode_available: true,
-    is_remote_mode_available: true
-  */
-  OperationModeStateMsg current_operation_mode_ = {.mode = 1, .is_autoware_control_enabled = true, .is_in_transition = false, .is_stop_mode_available = true, .is_autonomous_mode_available = true, .is_local_mode_available = true, .is_remote_mode_available = true};
+  OperationModeStateMsg current_operation_mode_{};
 
   bool has_trajectory_ = false;
   bool has_odometry_ = false;
@@ -139,6 +133,12 @@ private:
 
   //
   void publishControlCommand(const trajectory_follower::LongitudinalOutput & lon_out, const trajectory_follower::LateralOutput & lat_out);
+  void publishControlValues(double velocity, double accel, double steer);
+
+  GuardPolicy guard_;
+  bool guard_on_{false};
+  bool re_enable_{false};
+  GuardState last_logged_state_{GuardState::INIT};
 
   //
   void publishProcessingTime(

@@ -91,6 +91,20 @@ else()
     message(FATAL_ERROR "Unsupported CONFIG_CONTROL_CMD_OUTPUT_MODE=${CONFIG_CONTROL_CMD_OUTPUT_MODE}. Use DDS_ONLY, CAN_ONLY, or DDS_AND_CAN.")
 endif()
 
+set(CONFIG_GUARD_ENABLE ON CACHE BOOL "Enable SI output guard")
+set(CONFIG_SI_MODE "RUN" CACHE STRING "SI run mode: RUN, AUTOWARE, STOP")
+set_property(CACHE CONFIG_SI_MODE PROPERTY STRINGS "RUN" "AUTOWARE" "STOP")
+set(CONFIG_SI_MODE_RUN 0)
+set(CONFIG_SI_MODE_AUTOWARE 0)
+set(CONFIG_SI_MODE_STOP 0)
+if(CONFIG_SI_MODE STREQUAL "AUTOWARE")
+    set(CONFIG_SI_MODE_AUTOWARE 1)
+elseif(CONFIG_SI_MODE STREQUAL "STOP")
+    set(CONFIG_SI_MODE_STOP 1)
+else()
+    set(CONFIG_SI_MODE_RUN 1)
+endif()
+
 # Generate platform config header
 configure_file(
     ${ACTUATION_DIR}/include/platform/freertos/freertos_config_generated.h.in
@@ -253,6 +267,26 @@ if(BUILD_TEST STREQUAL "1")
     add_custom_command(TARGET rpmsg_netif_core_test POST_BUILD
         COMMAND rpmsg_netif_core_test
         COMMENT "Running rpmsg_netif_core host unit test"
+        VERBATIM
+    )
+endif()
+
+if(NOT BUILD_TEST STREQUAL "4")
+    add_executable(guard_policy_test
+        ${ACTUATION_DIR}/test/guard_policy_test.cpp
+    )
+    set_source_files_properties(
+        ${ACTUATION_DIR}/test/guard_policy_test.cpp PROPERTIES
+        COMPILE_DEFINITIONS "main=main"
+    )
+    target_include_directories(guard_policy_test PRIVATE
+        ${ACTUATION_DIR}/src/autoware/autoware_trajectory_follower_node/include
+    )
+    target_compile_features(guard_policy_test PRIVATE cxx_std_17)
+    target_compile_options(guard_policy_test PRIVATE -Wall -Wextra)
+    add_custom_command(TARGET guard_policy_test POST_BUILD
+        COMMAND guard_policy_test
+        COMMENT "Running guard_policy host unit test"
         VERBATIM
     )
 endif()

@@ -14,6 +14,8 @@
 // limitations under the License.
 
 #include "autoware/trajectory_follower_node/controller_node.hpp"
+#include "autoware/trajectory_follower_node/guard_enable.hpp"
+#include "autoware/trajectory_follower_node/run_mode.hpp"
 #include "autoware/mpc_lateral_controller/mpc_lateral_controller.hpp"
 #include "autoware/pid_longitudinal_controller/pid_longitudinal_controller.hpp"
 #include <autoware/trajectory_follower_base/lateral_controller_base.hpp>
@@ -25,8 +27,10 @@ using namespace common::logger;
 #include "platform/platform_threading.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -91,12 +95,36 @@ Controller::Controller() : Node("controller", node_stack, STACK_SIZE)
   auto subscriber_acceleration = create_subscription<AccelWithCovarianceStampedMsg>("/localization/acceleration",
                                                               &geometry_msgs_msg_AccelWithCovarianceStamped_desc,
                                                               callbackAcceleration, this);
-  auto subscriber_operation_mode_state = create_subscription<OperationModeStateMsg>("/system/operation_mode/state",
-                                                              &autoware_adapi_v1_msgs_msg_OperationModeState_desc,
-                                                              callbackOperationModeState, this);
-    
   output_mode_ = common::can::configured_control_command_output_mode();
   log_info("Control command output mode: %s", common::can::output_mode_name(output_mode_));
+  {
+    const SiMode mode = si_mode();
+    log_info("Run mode: %s", si_mode_name(mode));
+    if (mode == SiMode::Autoware) {
+      has_operation_mode_ = false;
+      create_subscription<OperationModeStateMsg>(
+        "/system/operation_mode/state",
+        &autoware_adapi_v1_msgs_msg_OperationModeState_desc,
+        callbackOperationModeState, this);
+    } else {
+      current_operation_mode_ = OperationModeStateMsg{};
+      current_operation_mode_.is_autoware_control_enabled = true;
+      current_operation_mode_.is_in_transition = false;
+      current_operation_mode_.is_stop_mode_available = true;
+      current_operation_mode_.is_autonomous_mode_available = true;
+      current_operation_mode_.is_local_mode_available = true;
+      current_operation_mode_.is_remote_mode_available = true;
+      current_operation_mode_.mode =
+        (mode == SiMode::Run) ? OPERATION_MODE_STATE_AUTONOMOUS : OPERATION_MODE_STATE_STOP;
+      has_operation_mode_ = true;
+    }
+  }
+  guard_on_ = guard_enabled();
+  log_info("Guard: %s (compiled=%d)", guard_on_ ? "ON" : "OFF", guard_compiled_in() ? 1 : 0);
+  if (guard_on_) {
+    create_subscription<Float64Msg>(
+      "/guard/re_enable", &std_msgs_msg_Float64_desc, callbackReEnable, this);
+  }
 
   // Publishers
   if (common::can::output_mode_uses_dds(output_mode_)) {
@@ -136,16 +164,8 @@ void Controller::callbackSteeringStatus(const SteeringReportMsg* msg, void* arg)
   controller->has_steering_ = true;
 }
 
-void Controller::callbackOperationModeState(const OperationModeStateMsg* msg, void* arg) {
-  // static int count = 0;
-  // log_debug("-------OPERATION MODE STATE----IDX %d----", count++);
-  // log_debug("Timestamp: %ld", Clock::toDouble(msg->stamp));
-  // log_debug("Mode: %d", msg->mode);
-  // log_debug("Autoware control enabled: %d", msg->is_autoware_control_enabled);
-  // log_debug("In transition: %d", msg->is_in_transition);
-  // log_debug("--------------------------------");
-
-  // Put data into state pointers
+void Controller::callbackOperationModeState(const OperationModeStateMsg* msg, void* arg)
+{
   Controller* controller = static_cast<Controller*>(arg);
   controller->current_operation_mode_ = *msg;
   controller->has_operation_mode_ = true;
@@ -170,6 +190,12 @@ void Controller::callbackOdometry(const OdometryMsg* msg, void* arg) {
   controller->current_odometry_.header.frame_id = nullptr;
   controller->current_odometry_.child_frame_id = nullptr;
   controller->has_odometry_ = true;
+  if (controller->guard_on_) {
+    EgoSnapshot ego;
+    ego.stamp_ms = Clock::now() * 1000.0;
+    ego.speed = msg->twist.twist.linear.x;
+    controller->guard_.on_odom(ego);
+  }
 }
 
 void Controller::callbackAcceleration(const AccelWithCovarianceStampedMsg* msg, void* arg) {
@@ -206,6 +232,53 @@ void Controller::callbackTrajectory(const TrajectoryMsg_Raw* msg, void* arg) {
   // is currently disabled, but this keeps the field safe for any future reader).
   controller->current_trajectory_.header.frame_id = nullptr;
   controller->has_trajectory_ = true;
+  if (controller->guard_on_) {
+    TrajSnapshot snap;
+    snap.stamp_ms = Clock::now() * 1000.0;
+    const int n = static_cast<int>(controller->current_trajectory_.points.size());
+    snap.n_speeds = n < kMaxSpeeds ? n : kMaxSpeeds;
+    for (int i = 0; i < snap.n_speeds; ++i) {
+      snap.speeds[i] = controller->current_trajectory_.points[static_cast<size_t>(i)]
+                         .longitudinal_velocity_mps;
+    }
+    snap.curvature = 0.0;
+    if (snap.n_speeds >= 3) {
+      auto yaw_of = [](const autoware_planning_msgs_msg_TrajectoryPoint & p) {
+        const auto & q = p.pose.orientation;
+        return std::atan2(
+          2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+      };
+      double dist = 0.0;
+      const int m = snap.n_speeds < 5 ? snap.n_speeds : 5;
+      for (int i = 1; i < m; ++i) {
+        const auto & a = controller->current_trajectory_.points[static_cast<size_t>(i - 1)].pose.position;
+        const auto & b = controller->current_trajectory_.points[static_cast<size_t>(i)].pose.position;
+        dist += std::hypot(b.x - a.x, b.y - a.y);
+      }
+      if (dist > 0.5) {
+        const double y0 = yaw_of(controller->current_trajectory_.points[0]);
+        const double y1 = yaw_of(controller->current_trajectory_.points[static_cast<size_t>(m - 1)]);
+        double dyaw = y1 - y0;
+        constexpr double pi = 3.14159265358979323846;
+        while (dyaw > pi) {
+          dyaw -= 2.0 * pi;
+        }
+        while (dyaw < -pi) {
+          dyaw += 2.0 * pi;
+        }
+        snap.curvature = dyaw / dist;
+      }
+    }
+    controller->guard_.on_traj(snap, snap.stamp_ms);
+  }
+}
+
+void Controller::callbackReEnable(const Float64Msg* msg, void* arg)
+{
+  Controller* controller = static_cast<Controller*>(arg);
+  if (msg != nullptr && msg->data > 0.5) {
+    controller->re_enable_ = true;
+  }
 }
 
 Controller::LateralControllerMode Controller::getLateralControllerMode(
@@ -297,78 +370,84 @@ void Controller::callbackTimerControl()
   // out at the default INFO level (see PROFILE_* in logger.hpp).
   PROFILE_POINT(cyc_t0);
 
-  // 1. create input data
+  const double now_ms = Clock::now() * 1000.0;
   const auto input_data = createInputData();
-  if (!input_data) {
+  bool have_cmd = false;
+  std::optional<trajectory_follower::LateralOutput> lat_out;
+  std::optional<trajectory_follower::LongitudinalOutput> lon_out;
+
+  if (input_data) {
+    log_debug("Input data created");
+    const bool is_lat_ready = lateral_controller_->isReady(*input_data);
+    const bool is_lon_ready = longitudinal_controller_->isReady(*input_data);
+    if (is_lat_ready && is_lon_ready) {
+      log_debug("Controllers are ready");
+      PROFILE_POINT(cyc_t_ready);
+
+      stop_watch_.tic("lateral");
+      lat_out = lateral_controller_->run(*input_data);
+      stop_watch_.toc("lateral");
+      publishProcessingTime(stop_watch_.toc("lateral"), pub_processing_time_lat_ms_);
+      PROFILE_POINT(cyc_t_lat);
+
+      stop_watch_.tic("longitudinal");
+      lon_out = longitudinal_controller_->run(*input_data);
+      stop_watch_.toc("longitudinal");
+      publishProcessingTime(stop_watch_.toc("longitudinal"), pub_processing_time_lon_ms_);
+      PROFILE_POINT(cyc_t_lon);
+
+      longitudinal_controller_->sync(lat_out->sync_data);
+      lateral_controller_->sync(lon_out->sync_data);
+      have_cmd = true;
+    }
+  }
+
+  if (!guard_on_) {
+    if (!have_cmd) {
+      log_info_throttle("Control is skipped since input data is not ready.");
+      return;
+    }
+    publishControlCommand(*lon_out, *lat_out);
+    PROFILE_POINT(cyc_t_end);
+    PROFILE_LOG("CYCLE in=%.1f lat=%.1f lon=%.1f pub=%.1f total=%.1f [ms]",
+      PROFILE_MS(cyc_t0, cyc_t_ready), PROFILE_MS(cyc_t_ready, cyc_t_lat),
+      PROFILE_MS(cyc_t_lat, cyc_t_lon), PROFILE_MS(cyc_t_lon, cyc_t_end),
+      PROFILE_MS(cyc_t0, cyc_t_end));
+    return;
+  }
+
+  if (have_cmd) {
+    FollowerCmd c;
+    c.stamp_ms = now_ms;
+    c.velocity = lon_out->control_cmd.velocity;
+    c.accel = lon_out->control_cmd.acceleration;
+    c.steer = lat_out->control_cmd.steering_tire_angle;
+    guard_.on_follower(c);
+  }
+  const bool re = re_enable_;
+  re_enable_ = false;
+  const auto gout = guard_.step(now_ms, re);
+  if (gout.state != last_logged_state_) {
+    last_logged_state_ = gout.state;
+    log_warn("guard -> %s reason=%s", guard_state_name(gout.state), gout.reason);
+  }
+
+  if (gout.has_override) {
+    publishControlValues(
+      gout.override_cmd.velocity, gout.override_cmd.accel, gout.override_cmd.steer);
+  } else if (have_cmd) {
+    publishControlCommand(*lon_out, *lat_out);
+  } else {
     log_info_throttle("Control is skipped since input data is not ready.");
-    return;
   }
-
-  log_debug("Input data created");
-
-  // 2. check if controllers are ready
-  const bool is_lat_ready = lateral_controller_->isReady(*input_data);
-  const bool is_lon_ready = longitudinal_controller_->isReady(*input_data);
-  if (!is_lat_ready || !is_lon_ready) {
-    log_info_throttle("Control is skipped since lateral and/or longitudinal controllers are not ready to run.");
-    return;
-  }
-
-  log_debug("Controllers are ready");
-
-  PROFILE_POINT(cyc_t_ready);
-
-  // 3. run controllers
-  stop_watch_.tic("lateral");
-  const auto lat_out = lateral_controller_->run(*input_data);
-  stop_watch_.toc("lateral");
-  log_debug("Lateral controller elapsed time: %f", stop_watch_.toc("lateral"));
-
-  log_debug("-------LAT OUT--", 0);
-  log_debug("Lateral output: %f", lat_out.control_cmd.steering_tire_angle);
-  log_debug("Lateral steering tire rotation rate: %f", lat_out.control_cmd.steering_tire_rotation_rate);
-  log_debug("Lateral is defined steering tire rotation rate: %s", lat_out.control_cmd.is_defined_steering_tire_rotation_rate ? "true" : "false");
-
-  publishProcessingTime(stop_watch_.toc("lateral"), pub_processing_time_lat_ms_);
-
-  PROFILE_POINT(cyc_t_lat);
-
-  stop_watch_.tic("longitudinal");
-  const auto lon_out = longitudinal_controller_->run(*input_data);
-  stop_watch_.toc("longitudinal");
-  log_debug("Longitudinal controller elapsed time: %f", stop_watch_.toc("longitudinal"));
-
-  // TODO: do not calculate jerk here, it is not used !
-  log_debug("-------LON OUT--", 0);
-  log_debug("Longitudinal output: %f", lon_out.control_cmd.velocity);
-  log_debug("Longitudinal acceleration: %f", lon_out.control_cmd.acceleration);
-  log_debug("Longitudinal is defined acceleration: %s", lon_out.control_cmd.is_defined_acceleration ? "true" : "false");
-  log_debug("Longitudinal is defined jerk: %s", lon_out.control_cmd.is_defined_jerk ? "true" : "false");
-  log_debug("-------------------------------");
-
-  publishProcessingTime(stop_watch_.toc("longitudinal"), pub_processing_time_lon_ms_);
-
-  log_debug("Controllers ran");
-
-  PROFILE_POINT(cyc_t_lon);
-
-  // 4. sync with each other controllers
-  longitudinal_controller_->sync(lat_out.sync_data);
-  lateral_controller_->sync(lon_out.sync_data);
-
-  log_debug("Controllers synced");
-
-  // TODO(Horibe): Think specification. This comes from the old implementation.
-  // if (isTimeOut(lon_out, lat_out)) return;
-
-  // 5. publish control command
-  publishControlCommand(lon_out, lat_out);
 
   PROFILE_POINT(cyc_t_end);
-  PROFILE_LOG("CYCLE in=%.1f lat=%.1f lon=%.1f pub=%.1f total=%.1f [ms]",
-    PROFILE_MS(cyc_t0, cyc_t_ready), PROFILE_MS(cyc_t_ready, cyc_t_lat),
-    PROFILE_MS(cyc_t_lat, cyc_t_lon), PROFILE_MS(cyc_t_lon, cyc_t_end),
-    PROFILE_MS(cyc_t0, cyc_t_end));
+  if (have_cmd) {
+    PROFILE_LOG("CYCLE in=%.1f lat=%.1f lon=%.1f pub=%.1f total=%.1f [ms]",
+      PROFILE_MS(cyc_t0, cyc_t_ready), PROFILE_MS(cyc_t_ready, cyc_t_lat),
+      PROFILE_MS(cyc_t_lat, cyc_t_lon), PROFILE_MS(cyc_t_lon, cyc_t_end),
+      PROFILE_MS(cyc_t0, cyc_t_end));
+  }
 
   // 6. Reset flags for next cycle
   // TODO: Check if this is required, autoware version keeps publishing even there is no new data
@@ -386,6 +465,38 @@ void Controller::publishControlCommand(
   out.lateral.is_defined_steering_tire_rotation_rate = lat_out.control_cmd.is_defined_steering_tire_rotation_rate;
   out.lateral.stamp = out.stamp;
   out.longitudinal = lon_out.control_cmd;
+
+  if (common::can::output_mode_uses_dds(output_mode_)) {
+    if (control_cmd_pub_ && control_cmd_pub_->publish(out)) {
+      log_debug("Control command published over DDS");
+    } else {
+      log_error("Control command not published over DDS");
+    }
+  }
+
+  if (common::can::output_mode_uses_can(output_mode_)) {
+    if (!can_output_ || !can_output_->send(out, output_mode_)) {
+      if (output_mode_ == common::can::ControlCommandOutputMode::CAN_ONLY) {
+        log_error("Control command not sent over CAN in CAN_ONLY mode");
+      } else {
+        log_warn_throttle("Control command not sent over CAN; DDS output remains active");
+      }
+    } else {
+      log_debug("Control command sent over CAN");
+    }
+  }
+}
+
+void Controller::publishControlValues(double velocity, double accel, double steer)
+{
+  ControlMsg out{};
+  out.stamp = Clock::toRosTime(Clock::now());
+  out.lateral.steering_tire_angle = static_cast<float>(steer);
+  out.lateral.stamp = out.stamp;
+  out.longitudinal.stamp = out.stamp;
+  out.longitudinal.velocity = static_cast<float>(velocity);
+  out.longitudinal.acceleration = static_cast<float>(accel);
+  out.longitudinal.is_defined_acceleration = true;
 
   if (common::can::output_mode_uses_dds(output_mode_)) {
     if (control_cmd_pub_ && control_cmd_pub_->publish(out)) {
